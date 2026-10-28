@@ -12,7 +12,17 @@ import os
 import httpx
 import json
 import sqlite3
+import logging
+import time
 import traceback
+
+# ─── 로깅 설정 (Railway 로그에서 시간 표시) ───────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 # .env 파일에서 환경변수 로드 (GEMINI_API_KEY 등)
 load_dotenv()
@@ -49,19 +59,23 @@ async def gemini_translate(items: list, lang_name: str, fields: list) -> list:
 
         for attempt in range(3):
             try:
+                start = time.time()
                 async with httpx.AsyncClient() as client:
                     res = await client.post(
                         f'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={api_key}',
                         json={"contents": [{"parts": [{"text": prompt}]}]},
                         timeout=60
                     )
+                elapsed = time.time() - start
                 data = res.json()
 
                 if 'candidates' not in data or not data['candidates']:
-                    print(f"번역 재시도 {attempt+1} (배치 {i//batch_size+1}): {data.get('error', {}).get('message', 'candidates 없음')}")
+                    err = data.get('error', {}).get('message', 'candidates 없음')
+                    logger.warning(f"[Gemini] 재시도 {attempt+1}/3 | 배치 {i//batch_size+1} | {elapsed:.2f}s | {err}")
                     await asyncio.sleep(2)
                     continue
 
+                logger.info(f"[Gemini] 번역 완료 | {lang_name} | 배치 {i//batch_size+1} | {elapsed:.2f}s | {len(batch)}개")
                 text = data['candidates'][0]['content']['parts'][0]['text']
                 text = text.strip().replace('```json', '').replace('```', '').strip()
                 batch_result = json.loads(text)
@@ -69,12 +83,12 @@ async def gemini_translate(items: list, lang_name: str, fields: list) -> list:
                 break
 
             except httpx.ReadTimeout:
-                print(f"번역 타임아웃 (배치 {i//batch_size+1}, 시도 {attempt+1})")
+                logger.error(f"[Gemini] 타임아웃 | 배치 {i//batch_size+1} | 시도 {attempt+1}")
                 if attempt == 2:
                     raise
                 await asyncio.sleep(2)
             except Exception as e:
-                print(f"번역 오류 (배치 {i//batch_size+1}, 시도 {attempt+1}): {e}")
+                logger.error(f"[Gemini] 오류 | 배치 {i//batch_size+1} | 시도 {attempt+1} | {e}")
                 traceback.print_exc()
                 if attempt == 2:
                     raise
@@ -87,6 +101,7 @@ async def gemini_translate(items: list, lang_name: str, fields: list) -> list:
 @app.on_event("startup")
 def startup():
     init_db()
+    logger.info("[서버] Forworker API 시작")
 
 # ─── 헬스체크 ─────────────────────────────────────────────────
 @app.get("/")
@@ -107,6 +122,7 @@ def clear_cache(key: str = None):
         msg = "전체 캐시 삭제 완료"
     conn.commit()
     conn.close()
+    logger.info(f"[캐시] {msg}")
     return {"success": True, "message": msg}
 
 
@@ -118,6 +134,7 @@ async def get_recycling(city: str, language: str = "ko"):
     cache_key = f"recycling:{city}:{language}"
     cached = get_cache(cache_key)
     if cached:
+        logger.info(f"[캐시 히트] {cache_key}")
         return {"city": city, "language": language, "items": cached, "cached": True}
 
     items = get_recycling_data(city)
@@ -131,7 +148,7 @@ async def get_recycling(city: str, language: str = "ko"):
         set_cache(cache_key, translated, hours=168)
         return {"city": city, "language": language, "items": translated}
     except Exception as e:
-        print(f"번역 오류: {e}")
+        logger.error(f"[분리수거] 번역 오류: {e}")
         traceback.print_exc()
         return {"city": city, "language": "ko", "items": items}
 
@@ -144,6 +161,7 @@ async def get_welfare(city: str, language: str = "ko"):
     cache_key = f"welfare:{city}:{language}"
     cached = get_cache(cache_key)
     if cached:
+        logger.info(f"[캐시 히트] {cache_key}")
         return {"city": city, "language": language, "items": cached, "cached": True}
 
     ko_key = f"welfare:{city}:ko"
@@ -164,7 +182,7 @@ async def get_welfare(city: str, language: str = "ko"):
         set_cache(cache_key, translated, hours=24)
         return {"city": city, "language": language, "items": translated}
     except Exception as e:
-        print(f"복지정책 번역 오류: {e}")
+        logger.error(f"[복지정책] 번역 오류: {e}")
         traceback.print_exc()
         return {"city": city, "language": "ko", "items": items}
 
@@ -213,7 +231,7 @@ async def get_missions_list(device_id: str, language: str = "ko"):
         set_cache(cache_key, translated, hours=24)
         return {"missions": translated, "date": today}
     except Exception as e:
-        print(f"미션 번역 오류: {e}")
+        logger.error(f"[미션] 번역 오류: {e}")
         traceback.print_exc()
         return {"missions": daily, "date": today}
 
@@ -236,8 +254,6 @@ def cancel_mission_endpoint(mission_id: int, device_id: str):
 
 
 # ─── 할랄 식당 검색 ───────────────────────────────────────────
-# forworker_map.py의 fetch_places_by_category 사용
-# 할랄 키워드 4개(할랄/무슬림/이슬람음식/halal) 병렬 검색 + 중복 제거
 @app.get("/halal/nearby")
 async def get_halal_nearby(lat: float, lng: float, radius: int = 5000):
     from forworker_map import fetch_places_by_category
@@ -246,9 +262,6 @@ async def get_halal_nearby(lat: float, lng: float, radius: int = 5000):
 
 
 # ─── 장소 검색 (카페 / 관광명소 등) ──────────────────────────
-# forworker_map.py의 fetch_places_by_category 사용
-# category: 'cafe'(CE7) | 'tourist'(AT4) | 'restaurant'(FD6)
-# forworker_map.tsx 카테고리 탭에서 호출됨
 @app.get("/places/nearby")
 async def get_places_nearby(lat: float, lng: float, category: str = "cafe", radius: int = 5000):
     from forworker_map import fetch_places_by_category
