@@ -12,6 +12,16 @@ import os
 import httpx
 import json
 import sqlite3
+import logging
+import time
+
+# 로깅 설정 (Railway 로그에서 시간 표시) 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 # .env 파일에서 환경변수 로드 (GEMINI_API_KEY 등)
 load_dotenv()
@@ -46,20 +56,24 @@ async def gemini_translate(items: list, lang_name: str, fields: list) -> list:
 {items_text}"""
 
     for attempt in range(3):  # 최대 3회 재시도
+        start = time.time()
         async with httpx.AsyncClient() as client:
             res = await client.post(
                 f'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={api_key}',
                 json={"contents": [{"parts": [{"text": prompt}]}]},
-                timeout=30
+                timeout=60
             )
+        elapsed = time.time() - start
         data = res.json()
 
         # candidates 없으면 재시도 (quota 초과, 안전 필터 등)
         if 'candidates' not in data or not data['candidates']:
-            print(f"번역 재시도 {attempt+1}: {data.get('error', {}).get('message', 'candidates 없음')}")
+            err = data.get('error', {}).get('message', 'candidates 없음')
+            logger.warning(f"[Gemini] 재시도 {attempt+1}/3 | {elapsed:.2f}s | {err}")
             await asyncio.sleep(2)
             continue
 
+        logger.info(f"[Gemini] 번역 완료 | {lang_name} | {elapsed:.2f}s | 항목 {len(items)}개")
         # 응답 텍스트에서 ```json 마크다운 제거 후 파싱
         text = data['candidates'][0]['content']['parts'][0]['text']
         text = text.strip().replace('```json', '').replace('```', '').strip()
@@ -73,6 +87,7 @@ async def gemini_translate(items: list, lang_name: str, fields: list) -> list:
 @app.on_event("startup")
 def startup():
     init_db()
+    logger.info("[서버] Forworker API 시작")
 
 # ─── 헬스체크 ─────────────────────────────────────────────────
 @app.get("/")
@@ -95,6 +110,7 @@ def clear_cache(key: str = None):
         msg = "전체 캐시 삭제 완료"
     conn.commit()
     conn.close()
+    logger.info(f"[캐시] {msg}")
     return {"success": True, "message": msg}
 
 
@@ -108,7 +124,7 @@ async def get_recycling(city: str, language: str = "ko"):
     cache_key = f"recycling:{city}:{language}"
     cached = get_cache(cache_key)
     if cached:
-        print(f"캐시 히트: {cache_key}")
+        logger.info(f"[캐시 히트] {cache_key}")
         return {"city": city, "language": language, "items": cached, "cached": True}
 
     # 크롤링으로 한국어 원본 데이터 수집
@@ -124,7 +140,7 @@ async def get_recycling(city: str, language: str = "ko"):
         set_cache(cache_key, translated, hours=168)
         return {"city": city, "language": language, "items": translated}
     except Exception as e:
-        print(f"번역 오류: {e}")
+        logger.error(f"[분리수거] 번역 오류: {type(e).__name__}: {e}")
         # 번역 실패 시 한국어로 폴백
         return {"city": city, "language": "ko", "items": items}
 
@@ -133,38 +149,63 @@ async def get_recycling(city: str, language: str = "ko"):
 # 복지로 API 크롤링 → 언어별 번역 → 캐시(24시간)
 # 한국어 원본은 별도 캐시 키로 저장해서 언어 추가 시 재크롤링 방지
 @app.get("/welfare/{city}")
-async def get_welfare(city: str, language: str = "ko"):
+async def get_welfare(city: str, language: str = "ko", page: int = 1, page_size: int = 6):
     from welfare import fetch_welfare
 
-    cache_key = f"welfare:{city}:{language}"
-    cached = get_cache(cache_key)
-    if cached:
-        print(f"캐시 히트: {cache_key}")
-        return {"city": city, "language": language, "items": cached, "cached": True}
-
-    # 한국어 원본 캐시 확인, 없으면 크롤링
+    # 전체 한국어 데이터 캐시
     ko_key = f"welfare:{city}:ko"
     items = get_cache(ko_key)
     if not items:
         items = await fetch_welfare(city)
         set_cache(ko_key, items, hours=24)
 
-    if language == "ko":
-        return {"city": city, "language": language, "items": items}
+    # 페이지네이션 (전체 데이터에서 슬라이싱)
+    total = len(items)
+    start = (page - 1) * page_size
+    end = start + page_size
+    page_items = items[start:end]
+    total_pages = (total + page_size - 1) // page_size
 
-    # 한국어 외 언어는 Gemini로 번역
-    # link, target 필드는 번역 불필요 → 원본에서 복사
+    if language == "ko":
+        return {
+            "city": city, "language": language,
+            "items": page_items,
+            "page": page, "total_pages": total_pages, "total": total
+        }
+
+    # 페이지 단위 번역 캐시
+    cache_key = f"welfare:{city}:{language}:page{page}"
+    cached = get_cache(cache_key)
+    if cached:
+        logger.info(f"[캐시 히트] {cache_key}")
+        return {
+            "city": city, "language": language,
+            "items": cached,
+            "page": page, "total_pages": total_pages, "total": total,
+            "cached": True
+        }
+
     try:
         lang_name = LANG_MAP.get(language, '영어')
-        translated = await gemini_translate(items, lang_name, ['title', 'description'])
+        translated = await gemini_translate(page_items, lang_name, ['title', 'description'])
         for i, item in enumerate(translated):
-            item['link'] = items[i].get('link', '')
-            item['target'] = items[i].get('target', '')
+            item['link'] = page_items[i].get('link', '')
+            item['target'] = page_items[i].get('target', '')
+            item['category'] = page_items[i].get('category', '')
+            item['isForeigner'] = page_items[i].get('isForeigner', False)
         set_cache(cache_key, translated, hours=24)
-        return {"city": city, "language": language, "items": translated}
+        return {
+            "city": city, "language": language,
+            "items": translated,
+            "page": page, "total_pages": total_pages, "total": total
+        }
     except Exception as e:
-        print(f"복지정책 번역 오류: {e}")
-        return {"city": city, "language": "ko", "items": items}
+        logger.error(f"[복지정책] 번역 오류: {type(e).__name__}: {e}")
+        return {
+            "city": city, "language": language,
+            "items": page_items,
+            "page": page, "total_pages": total_pages, "total": total
+        }
 
 
 # ─── 기도 시간 ────────────────────────────────────────────────
@@ -220,7 +261,7 @@ async def get_missions_list(device_id: str, language: str = "ko"):
         set_cache(cache_key, translated, hours=24)
         return {"missions": translated, "date": today}
     except Exception as e:
-        print(f"미션 번역 오류: {e}")
+        logger.error(f"[미션] 번역 오류: {type(e).__name__}: {e}")
         return {"missions": daily, "date": today}
 
 
@@ -248,6 +289,24 @@ def cancel_mission_endpoint(mission_id: int, device_id: str):
 # ─── 할랄 식당 검색 ───────────────────────────────────────────
 @app.get("/halal/nearby")
 async def get_halal_nearby(lat: float, lng: float, radius: int = 3000):
-    from forworker_map import fetch_halal_restaurants  # ← 여기만 변경
+    from forworker_map import fetch_halal_restaurants
     restaurants = await fetch_halal_restaurants(lat, lng, radius)
     return {"restaurants": restaurants, "count": len(restaurants)}
+
+
+# ─── 카테고리별 장소 검색 ─────────────────────────────────────
+# category: halal | tourist | restaurant | cafe
+# - halal      : 할랄/무슬림/이슬람음식 키워드 병렬 검색
+# - tourist    : 카카오 카테고리 AT4 (관광명소)
+# - restaurant : 카카오 카테고리 FD6 (음식점)
+# - cafe       : 카카오 카테고리 CE7 (카페/베이커리)
+@app.get("/places/nearby")
+async def get_places_nearby(
+    lat: float,
+    lng: float,
+    category: str = "halal",
+    radius: int = 5000,
+):
+    from forworker_map import fetch_places_by_category
+    places = await fetch_places_by_category(lat, lng, category, radius)
+    return {"places": places, "count": len(places), "category": category}

@@ -1,93 +1,165 @@
 # ─── forworker_map.py ─────────────────────────────────────────
 # 지도 기반 장소 검색 로직이에요.
-# 카카오 로컬 API(장소 검색)를 사용해서 현재 위치 주변 할랄 식당을 가져와요.
-# 추후 관광지, 병원 등 다른 장소 유형도 이 파일에서 확장할 수 있어요.
+# 카카오 로컬 API(장소 검색 + 카테고리 검색)를 사용해요.
 #
-# [사용 API]
-# - 카카오 로컬 키워드 검색: https://dapi.kakao.com/v2/local/search/keyword.json
-# - 인증: REST API 키 (헤더 Authorization: KakaoAK {key})
-# - Railway 환경변수: KAKAO_API_KEY
-#
-# [검색 방식]
-# - 키워드 '할랄'로 검색
-# - 현재 위치(위도/경도) 기준 반경 내 결과만 반환
-# - 거리순(distance) 정렬 → 가장 가까운 식당부터 표시
-#
-# [반환 데이터]
-# - name     : 식당 이름
-# - address  : 도로명 주소 (없으면 지번 주소)
-# - phone    : 전화번호
-# - distance : 현재 위치에서의 거리 (미터 단위)
-# - lat      : 식당 위도 (지도 핀 표시에 사용)
-# - lng      : 식당 경도 (지도 핀 표시에 사용)
-# - url      : 카카오맵 상세 페이지 링크
+# [카테고리]
+# - halal     : '할랄', '무슬림', '이슬람음식', 'halal' 키워드 검색
+# - tourist   : 카테고리 AT4 (관광명소)
+# - restaurant: 카테고리 FD6 (음식점) — 일반 식당/베이커리 fallback
+# - cafe      : 카테고리 CE7 (카페/베이커리)
 
-import httpx
+import asyncio
 import os
 
+import httpx
 
-async def fetch_halal_restaurants(lat: float, lng: float, radius: int = 3000):
+KAKAO_CATEGORY_CODES = {
+    'tourist': 'AT4',    # 관광명소
+    'restaurant': 'FD6', # 음식점
+    'cafe': 'CE7',       # 카페/베이커리
+}
+
+HALAL_KEYWORDS = ['할랄', '무슬림', '이슬람음식', 'halal']
+
+
+async def _search_keyword(
+    client: httpx.AsyncClient,
+    key: str,
+    query: str,
+    lng: float,
+    lat: float,
+    radius: int,
+) -> list:
+    """단일 키워드로 카카오 로컬 키워드 검색"""
+    try:
+        res = await client.get(
+            'https://dapi.kakao.com/v2/local/search/keyword.json',
+            headers={'Authorization': f'KakaoAK {key}'},
+            params={
+                'query': query,
+                'x': str(lng),
+                'y': str(lat),
+                'radius': str(radius),
+                'sort': 'distance',
+                'size': '15',
+            },
+            timeout=10,
+        )
+        data = res.json()
+        return data.get('documents', [])
+    except Exception as e:
+        print(f"키워드 '{query}' 검색 오류: {e}")
+        return []
+
+
+async def _search_category(
+    client: httpx.AsyncClient,
+    key: str,
+    category_group_code: str,
+    lng: float,
+    lat: float,
+    radius: int,
+) -> list:
+    """카카오 로컬 카테고리 검색"""
+    try:
+        res = await client.get(
+            'https://dapi.kakao.com/v2/local/search/category.json',
+            headers={'Authorization': f'KakaoAK {key}'},
+            params={
+                'category_group_code': category_group_code,
+                'x': str(lng),
+                'y': str(lat),
+                'radius': str(radius),
+                'sort': 'distance',
+                'size': '15',
+            },
+            timeout=10,
+        )
+        data = res.json()
+        return data.get('documents', [])
+    except Exception as e:
+        print(f"카테고리 '{category_group_code}' 검색 오류: {e}")
+        return []
+
+
+def _normalize_places(docs: list, category: str) -> list:
+    """카카오 응답을 공통 형식으로 변환"""
+    places = []
+    seen_urls: set[str] = set()
+    for place in docs:
+        url = place.get('place_url', '')
+        if url and url in seen_urls:
+            continue
+        if url:
+            seen_urls.add(url)
+        places.append({
+            'name': place.get('place_name', ''),
+            'address': place.get('road_address_name') or place.get('address_name', ''),
+            'phone': place.get('phone', ''),
+            'distance': int(place.get('distance', 0)),
+            'lat': float(place.get('y', 0)),
+            'lng': float(place.get('x', 0)),
+            'url': url,
+            'category': category,
+        })
+    return places
+
+
+async def fetch_places_by_category(
+    lat: float,
+    lng: float,
+    category: str = 'halal',
+    radius: int = 5000,
+) -> list:
     """
-    위도(lat), 경도(lng) 기준으로 반경 radius(m) 내 할랄 식당을 검색해요.
-    카카오 로컬 API 호출 → 결과 파싱 → 정제된 리스트 반환.
-    API 오류 발생 시 더미 데이터를 반환해서 앱이 크래시되지 않아요.
+    카테고리별 장소 검색.
+    category: 'halal' | 'tourist' | 'restaurant' | 'cafe'
     """
     kakao_api_key = os.getenv('KAKAO_API_KEY', '')
 
+    if not kakao_api_key:
+        print("KAKAO_API_KEY 환경변수가 없어요")
+        return get_dummy(category)
+
     try:
         async with httpx.AsyncClient() as client:
-            res = await client.get(
-                'https://dapi.kakao.com/v2/local/search/keyword.json',
-                headers={
-                    # 카카오 REST API 인증 헤더
-                    'Authorization': f'KakaoAK {kakao_api_key}'
-                },
-                params={
-                    'query': '할랄',          # 검색 키워드
-                    'x': str(lng),            # 경도 (카카오 API는 x=경도, y=위도)
-                    'y': str(lat),            # 위도
-                    'radius': str(radius),    # 검색 반경 (미터)
-                    'sort': 'distance',       # 거리순 정렬
-                    'size': '15',             # 최대 반환 개수
-                },
-                timeout=10
-            )
+            if category == 'halal':
+                # 키워드 병렬 검색
+                results = await asyncio.gather(*[
+                    _search_keyword(client, kakao_api_key, kw, lng, lat, radius)
+                    for kw in HALAL_KEYWORDS
+                ])
+                docs = [place for docs in results for place in docs]
+            else:
+                code = KAKAO_CATEGORY_CODES.get(category, 'FD6')
+                docs = await _search_category(client, kakao_api_key, code, lng, lat, radius)
 
-        data = res.json()
-        places = data.get('documents', [])  # 검색 결과 목록
-
-        # 카카오 API 응답 필드를 앱에서 사용할 형태로 정제
-        restaurants = []
-        for place in places:
-            restaurants.append({
-                'name': place.get('place_name', ''),
-                # 도로명 주소 우선, 없으면 지번 주소 사용
-                'address': place.get('road_address_name') or place.get('address_name', ''),
-                'phone': place.get('phone', ''),
-                'distance': int(place.get('distance', 0)),  # 미터 단위 거리
-                'lat': float(place.get('y', 0)),            # 위도 (카카오 응답에서 y)
-                'lng': float(place.get('x', 0)),            # 경도 (카카오 응답에서 x)
-                'url': place.get('place_url', ''),          # 카카오맵 상세 링크
-            })
-
-        return restaurants
+        places = _normalize_places(docs, category)
+        places.sort(key=lambda r: r['distance'])
+        print(f"[{category}] 검색 완료: {len(places)}곳 (반경 {radius}m)")
+        return places
 
     except Exception as e:
-        print(f"할랄 식당 검색 오류: {e}")
-        # API 오류 시 더미 데이터 반환 (앱 크래시 방지)
-        return get_halal_dummy()
+        print(f"장소 검색 오류: {e}")
+        return get_dummy(category)
 
 
+# 기존 API 호환성 유지
+async def fetch_halal_restaurants(lat: float, lng: float, radius: int = 5000):
+    return await fetch_places_by_category(lat, lng, 'halal', radius)
+
+
+def get_dummy(category: str = 'halal') -> list:
+    """API 오류 시 반환하는 더미 데이터"""
+    dummy_map = {
+        'halal': [{'name': '할랄 식당 (샘플)', 'address': '경기도 안산시 단원구', 'phone': '', 'distance': 500, 'lat': 37.3219, 'lng': 126.8308, 'url': '', 'category': 'halal'}],
+        'tourist': [{'name': '안산 관광명소 (샘플)', 'address': '경기도 안산시', 'phone': '', 'distance': 800, 'lat': 37.3210, 'lng': 126.8310, 'url': '', 'category': 'tourist'}],
+        'restaurant': [{'name': '식당 (샘플)', 'address': '경기도 안산시 단원구', 'phone': '', 'distance': 300, 'lat': 37.3225, 'lng': 126.8300, 'url': '', 'category': 'restaurant'}],
+        'cafe': [{'name': '카페/베이커리 (샘플)', 'address': '경기도 안산시 단원구', 'phone': '', 'distance': 400, 'lat': 37.3230, 'lng': 126.8305, 'url': '', 'category': 'cafe'}],
+    }
+    return dummy_map.get(category, dummy_map['halal'])
+
+
+# 기존 호환성
 def get_halal_dummy():
-    """API 오류 또는 결과 없을 때 반환하는 더미 데이터"""
-    return [
-        {
-            'name': '할랄 식당 (샘플)',
-            'address': '경기도 안산시 단원구',
-            'phone': '',
-            'distance': 500,
-            'lat': 37.3219,
-            'lng': 126.8308,
-            'url': '',
-        },
-    ]
+    return get_dummy('halal')
