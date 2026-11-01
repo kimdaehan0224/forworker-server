@@ -11,3 +11,6 @@ __pycache__/
 # 디버그 파일
 *.log
 ansan_debug.html
+
+# 버트스코어 검증
+forworker_bertscore.py

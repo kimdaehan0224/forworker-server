@@ -155,36 +155,49 @@ async def get_recycling(city: str, language: str = "ko"):
 
 # ─── 복지 정책 ────────────────────────────────────────────────
 @app.get("/welfare/{city}")
-async def get_welfare(city: str, language: str = "ko"):
+async def get_welfare(city: str, language: str = "ko", page: int = 1, page_size: int = 6):
     from welfare import fetch_welfare
 
-    cache_key = f"welfare:{city}:{language}"
+    # 한국어 전체 원본 캐시
+    ko_key = f"welfare:{city}:ko"
+    all_items = get_cache(ko_key)
+    if not all_items:
+        all_items = await fetch_welfare(city)
+        set_cache(ko_key, all_items, hours=24)
+
+    # 페이지 계산
+    total = len(all_items)
+    total_pages = (total + page_size - 1) // page_size
+    start = (page - 1) * page_size
+    end = start + page_size
+    page_items = all_items[start:end]
+
+    if language == "ko":
+        return {"city": city, "language": language, "items": page_items,
+                "page": page, "total_pages": total_pages, "total": total}
+
+    # 번역 캐시 키에 page 포함
+    cache_key = f"welfare:{city}:{language}:p{page}"
     cached = get_cache(cache_key)
     if cached:
         logger.info(f"[캐시 히트] {cache_key}")
-        return {"city": city, "language": language, "items": cached, "cached": True}
-
-    ko_key = f"welfare:{city}:ko"
-    items = get_cache(ko_key)
-    if not items:
-        items = await fetch_welfare(city)
-        set_cache(ko_key, items, hours=24)
-
-    if language == "ko":
-        return {"city": city, "language": language, "items": items}
+        return {"city": city, "language": language, "items": cached,
+                "page": page, "total_pages": total_pages, "total": total, "cached": True}
 
     try:
         lang_name = LANG_MAP.get(language, '영어')
-        translated = await gemini_translate(items, lang_name, ['title', 'description'])
+        translated = await gemini_translate(page_items, lang_name, ['title', 'description'])
         for i, item in enumerate(translated):
-            item['link'] = items[i].get('link', '')
-            item['target'] = items[i].get('target', '')
+            item['link'] = page_items[i].get('link', '')
+            item['target'] = page_items[i].get('target', '')
         set_cache(cache_key, translated, hours=24)
-        return {"city": city, "language": language, "items": translated}
+        return {"city": city, "language": language, "items": translated,
+                "page": page, "total_pages": total_pages, "total": total}
     except Exception as e:
         logger.error(f"[복지정책] 번역 오류: {e}")
         traceback.print_exc()
-        return {"city": city, "language": "ko", "items": items}
+        return {"city": city, "language": "ko", "items": page_items,
+                "page": page, "total_pages": total_pages, "total": total}
 
 
 # ─── 기도 시간 ────────────────────────────────────────────────
